@@ -1,0 +1,107 @@
+@import "tailwindcss";
+
+:root {
+  --app-height: 100dvh;
+  --app-width: 100vw;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --keyboard-offset: 0px;
+}
+
+/* Ensure full viewport locking without rubber-banding or address bar clipping */
+html {
+  height: 100%;
+  height: -webkit-fill-available;
+  height: 100dvh;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  position: fixed;
+  overscroll-behavior: none;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  height: 100%;
+  height: -webkit-fill-available;
+  height: 100dvh;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  position: fixed;
+  overscroll-behavior: none;
+  background-color: #020617; /* slate-950 */
+}
+
+#root {
+  height: 100%;
+  height: var(--app-height, 100dvh);
+  width: 100%;
+  width: var(--app-width, 100vw);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Safe Area Inset Helpers */
+.pt-safe {
+  padding-top: max(0.5rem, env(safe-area-inset-top, 0px));
+}
+
+.pb-safe {
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom, 0px));
+}
+
+.pl-safe {
+  padding-left: max(0.5rem, env(safe-area-inset-left, 0px));
+}
+
+.pr-safe {
+  padding-right: max(0.5rem, env(safe-area-inset-right, 0px));
+}
+
+.px-safe {
+  padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
+  padding-right: max(0.75rem, env(safe-area-inset-right, 0px));
+}
+
+/* Dynamic App Height Helper */
+.h-dynamic-screen {
+  height: 100dvh;
+  height: var(--app-height, 100dvh);
+}
+
+.max-h-dynamic {
+  max-height: 100dvh;
+  max-height: var(--app-height, 100dvh);
+}
+
+/* Ultra-compact screen micro-adjustments */
+body.is-compact {
+  font-size: 13px;
+}
+
+body.is-compact .chat-bubble {
+  max-width: 90% !important;
+  font-size: 13px !important;
+}
+
+/* Smooth transitions for HUD and responsive modals */
+@keyframes slideDown {
+  from {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-down {
+  animation: slideDown 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}

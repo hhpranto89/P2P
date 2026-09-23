@@ -1,0 +1,6 @@
+{
+  "appId": "com.nexusp2p.messenger",
+  "appName": "Nexus P2P",
+  "webDir": "dist",
+  "bundledWebRuntime": false
+}

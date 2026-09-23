@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect width="512" height="512" rx="128" fill="#0f172a" />
+  <circle cx="256" cy="256" r="180" stroke="#0ea5e9" stroke-width="12" stroke-dasharray="8 8" opacity="0.4" />
+  <!-- Node A -->
+  <circle cx="160" cy="256" r="54" fill="#0284c7" />
+  <circle cx="160" cy="256" r="36" fill="#38bdf8" />
+  <!-- Node B -->
+  <circle cx="352" cy="256" r="54" fill="#6366f1" />
+  <circle cx="352" cy="256" r="36" fill="#818cf8" />
+  <!-- Peer connection beam -->
+  <path d="M 196 256 L 316 256" stroke="#38bdf8" stroke-width="14" stroke-linecap="round" />
+  <!-- Data waves -->
+  <path d="M 230 220 Q 256 195 282 220" stroke="#38bdf8" stroke-width="8" stroke-linecap="round" fill="none" />
+  <path d="M 215 190 Q 256 155 297 190" stroke="#0ea5e9" stroke-width="8" stroke-linecap="round" fill="none" opacity="0.7" />
+  <path d="M 230 292 Q 256 317 282 292" stroke="#818cf8" stroke-width="8" stroke-linecap="round" fill="none" />
+  <path d="M 215 322 Q 256 357 297 322" stroke="#6366f1" stroke-width="8" stroke-linecap="round" fill="none" opacity="0.7" />
+</svg>
