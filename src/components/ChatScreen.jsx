@@ -38,6 +38,7 @@ export default function ChatScreen({
   onBack,
   onStartCall,
   onOpenSettings,
+  onRetryConnect,
 }) {
   const [messages, setMessages] = useState([]);
   const [inputMessage, setInputMessage] = useState('');
@@ -511,14 +512,14 @@ export default function ChatScreen({
             <h2 className="text-xs sm:text-sm font-bold text-white truncate">
               {contactName || remotePeerId}
             </h2>
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-1.5 flex-wrap">
               <span
                 className={`w-2 h-2 rounded-full shrink-0 ${
                   connectionState === 'connected'
                     ? 'bg-emerald-400'
                     : connectionState === 'connecting'
                     ? 'bg-amber-400 animate-pulse'
-                    : 'bg-slate-500'
+                    : 'bg-rose-400'
                 }`}
               />
               <span className="text-[10px] text-slate-400 font-mono truncate">
@@ -528,6 +529,16 @@ export default function ChatScreen({
                   ? 'Connecting...'
                   : 'Offline'}
               </span>
+              {connectionState !== 'connected' && onRetryConnect && (
+                <button
+                  type="button"
+                  onClick={onRetryConnect}
+                  className="text-[9px] px-1.5 py-0.2 rounded bg-cyan-950/80 hover:bg-cyan-900 text-cyan-300 border border-cyan-800/60 font-mono transition"
+                  title="Retry P2P connection"
+                >
+                  Retry
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -575,6 +586,26 @@ export default function ChatScreen({
               <span>View</span>
               <ExternalLink className="w-3 h-3" />
             </a>
+          )}
+        </div>
+      )}
+
+      {/* Connection State Info Banner */}
+      {connectionState === 'connecting' && (
+        <div className="px-3 sm:px-4 py-2 bg-amber-950/40 border-b border-amber-500/20 text-amber-300 text-xs flex items-center justify-between gap-2 shrink-0 animate-in fade-in">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
+            <span className="truncate">
+              Connecting to <strong className="font-mono">{remotePeerId}</strong> (ensure both devices have the app open)
+            </span>
+          </div>
+          {onRetryConnect && (
+            <button
+              onClick={onRetryConnect}
+              className="px-2 py-0.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 font-semibold text-[11px] shrink-0 transition"
+            >
+              Retry
+            </button>
           )}
         </div>
       )}

@@ -1,34 +1,53 @@
 /**
- * Nexus P2P Messenger - Serverless WebRTC Signaling & Peer Connection via Gun.js
+ * Nexus P2P Messenger - Robust WebRTC Signaling & Mesh via PeerJS
+ * Uses official public PeerServer (0.peerjs.com) with Google STUN + Metered TURN servers.
+ * Designed for serverless static hosts (Netlify, Vercel, PWA) and mobile data/NAT.
  */
-import Gun from 'gun/gun';
+import peerjsPkg from 'peerjs';
 
-const PUBLIC_RELAY_PEERS = [
-  'https://gun-manhattan.herokuapp.com/gun',
-  'https://peer.wallie.io/gun',
-  'https://gundb-relay-mlit.onrender.com/gun'
-];
+const Peer = peerjsPkg.Peer || peerjsPkg.default?.Peer || peerjsPkg.default || peerjsPkg;
 
+// High-reliability STUN & TURN servers for cross-network connectivity (Cellular 4G/5G, NAT traversal)
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun3.l.google.com:19302' },
-  { urls: 'stun:stun4.l.google.com:19302' }
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  // Open Relay Project (Free public TURN servers by Metered.ca - UDP & TCP 443)
+  {
+    urls: 'turn:openrelay.metered.ca:80',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
 ];
 
 export class P2PNetworkService {
   constructor() {
-    this.gun = null;
+    this.peer = null;
     this.myPeerId = this.getOrCreatePeerId();
-    this.peerConnection = null;
-    this.dataChannel = null;
     this.remotePeerId = null;
+    this.activeConnection = null;
+    this.activeMediaCall = null;
+    this.incomingMediaCall = null;
     this.localStream = null;
     this.remoteStream = null;
-    this.isInitiator = false;
-    this.processedSignals = new Set();
-    this.pendingCandidates = [];
+
+    this.isServerConnected = false;
+    this.pendingConnectTarget = null;
+    this.retryTimer = null;
+    this.retryCount = 0;
+    this.pingInterval = null;
 
     // Registered Event Handlers
     this.handlers = {
@@ -44,8 +63,19 @@ export class P2PNetworkService {
       onIceStateChange: () => {},
     };
 
-    this.initGun();
+    this.initPeer();
     this.initBroadcastFallback();
+
+    // Cleanly destroy peer on window unload to immediately release Peer ID on signaling server
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', () => {
+        if (this.peer && !this.peer.destroyed) {
+          try {
+            this.peer.destroy();
+          } catch (e) {}
+        }
+      });
+    }
   }
 
   getOrCreatePeerId() {
@@ -55,7 +85,7 @@ export class P2PNetworkService {
       id = `nexus-${rand}`;
       localStorage.setItem('nexus_peer_id', id);
     }
-    return id;
+    return id.trim().toLowerCase();
   }
 
   getMyPeerId() {
@@ -64,47 +94,129 @@ export class P2PNetworkService {
 
   setPeerId(newId) {
     if (!newId || newId.trim() === '') return;
-    this.myPeerId = newId.trim().toLowerCase();
+    const cleanId = newId.trim().toLowerCase();
+    if (cleanId === this.myPeerId) return;
+
+    this.myPeerId = cleanId;
     localStorage.setItem('nexus_peer_id', this.myPeerId);
-    this.initGun();
+    this.initPeer();
   }
 
-  initGun() {
+  /**
+   * Initialize PeerJS connection with 0.peerjs.com signaling
+   */
+  initPeer() {
+    // Teardown previous instance if any
+    if (this.peer && !this.peer.destroyed) {
+      try {
+        this.peer.destroy();
+      } catch (e) {}
+    }
+    this.isServerConnected = false;
+
     try {
-      this.gun = Gun({
-        peers: PUBLIC_RELAY_PEERS,
-        localStorage: true,
-        radisk: true,
+      this.peer = new Peer(this.myPeerId, {
+        host: '0.peerjs.com',
+        port: 443,
+        path: '/',
+        secure: true,
+        pingInterval: 5000,
+        config: {
+          iceServers: ICE_SERVERS,
+          iceCandidatePoolSize: 10,
+        },
       });
 
-      // Listen on my mailbox channel
-      const mySignalNode = this.gun.get('nexus_p2p_signals_v2').get(this.myPeerId);
-      
-      mySignalNode.map().on((data, key) => {
-        if (!data || typeof data !== 'object') return;
-        this.handleIncomingSignal(data, key);
+      this.peer.on('open', (id) => {
+        this.myPeerId = id;
+        this.isServerConnected = true;
+        console.log('[P2P] Registered with signaling server as:', id);
+
+        // If there was a pending connection attempt waiting for signaling server:
+        if (this.pendingConnectTarget) {
+          const target = this.pendingConnectTarget;
+          this.pendingConnectTarget = null;
+          this.connectToPeer(target);
+        }
+      });
+
+      // Handle incoming Data Connection (Receiver)
+      this.peer.on('connection', (conn) => {
+        console.log('[P2P] Incoming connection from:', conn.peer);
+        this.handleIncomingConnection(conn);
+      });
+
+      // Handle incoming Media Call (Audio/Video)
+      this.peer.on('call', (mediaCall) => {
+        console.log('[P2P] Incoming call from:', mediaCall.peer);
+        this.incomingMediaCall = mediaCall;
+        const isVideo = !!mediaCall.metadata?.isVideo;
+
+        this.emit('onIncomingCall', {
+          callerId: mediaCall.peer,
+          callerName: mediaCall.metadata?.callerId || mediaCall.peer,
+          isVideo,
+          timestamp: Date.now(),
+        });
+      });
+
+      this.peer.on('disconnected', () => {
+        console.warn('[P2P] Disconnected from signaling server. Reconnecting...');
+        this.isServerConnected = false;
+        if (this.peer && !this.peer.destroyed) {
+          this.peer.reconnect();
+        }
+      });
+
+      this.peer.on('close', () => {
+        this.isServerConnected = false;
+      });
+
+      this.peer.on('error', (err) => {
+        console.warn('[P2P] Peer error:', err.type, err.message);
+
+        if (err.type === 'peer-unavailable') {
+          // Remote peer is not yet connected to the signaling server (e.g. hasn't opened app yet)
+          this.emit('onConnectionStateChange', 'connecting', this.remotePeerId);
+          this.scheduleAutoRetry();
+        } else if (err.type === 'unavailable-id') {
+          // Peer ID is currently occupied (e.g. rapid page refresh)
+          console.warn('[P2P] ID unavailable, retrying in 2 seconds...');
+          setTimeout(() => {
+            if (this.peer && this.peer.destroyed) {
+              this.initPeer();
+            }
+          }, 2000);
+        } else if (err.type === 'network' || err.type === 'server-error') {
+          if (this.peer && !this.peer.destroyed) {
+            setTimeout(() => this.peer.reconnect(), 3000);
+          }
+        }
       });
     } catch (err) {
-      console.error('[GunSignaling] Failed to initialize Gun:', err);
+      console.error('[P2P] Failed to initialize Peer:', err);
     }
   }
 
   /**
-   * BroadcastChannel fallback for instant zero-latency signaling when testing
-   * across multiple tabs or windows on the same machine.
+   * BroadcastChannel for instant testing across multiple tabs on same browser
    */
   initBroadcastFallback() {
     if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
       try {
         this.bc = new BroadcastChannel('nexus_p2p_local_mesh');
         this.bc.onmessage = (event) => {
-          const { targetPeerId, signal, key } = event.data || {};
-          if (targetPeerId === this.myPeerId && signal) {
-            this.handleIncomingSignal(signal, key || `bc-${Date.now()}`);
+          const { targetPeerId, type, payload } = event.data || {};
+          if (targetPeerId === this.myPeerId) {
+            if (type === 'data') {
+              this.handleIncomingData(payload);
+            } else if (type === 'ping') {
+              this.emit('onConnectionStateChange', 'connected', payload?.from);
+            }
           }
         };
       } catch (err) {
-        console.warn('[BroadcastChannel] not supported or error:', err);
+        console.warn('[BroadcastChannel] error:', err);
       }
     }
   }
@@ -122,289 +234,212 @@ export class P2PNetworkService {
   }
 
   /**
-   * Post a signal message to a target peer's Gun mailbox
+   * Connect to a remote peer via WebRTC DataConnection
    */
-  sendSignal(targetPeerId, signalPayload) {
-    const enrichedSignal = {
-      ...signalPayload,
-      from: this.myPeerId,
-      timestamp: Date.now(),
-      nonce: Math.random().toString(36).substring(2, 9),
-    };
+  connectToPeer(targetPeerId) {
+    if (!targetPeerId) return;
+    const cleanId = targetPeerId.trim().toLowerCase();
+    if (cleanId === this.myPeerId) return;
 
-    // 1. Post via Gun.js
-    if (this.gun) {
-      const signalKey = `sig_${Date.now()}_${enrichedSignal.nonce}`;
-      this.gun
-        .get('nexus_p2p_signals_v2')
-        .get(targetPeerId)
-        .get(signalKey)
-        .put(enrichedSignal);
+    this.remotePeerId = cleanId;
+
+    // Check if already connected to this peer
+    if (
+      this.activeConnection &&
+      this.activeConnection.peer.toLowerCase() === cleanId &&
+      this.activeConnection.open
+    ) {
+      this.emit('onConnectionStateChange', 'connected', cleanId);
+      return;
     }
 
-    // 2. Broadcast via local channel (if tabs on same origin)
-    if (this.bc) {
-      this.bc.postMessage({
-        targetPeerId,
-        signal: enrichedSignal,
-        key: `bc_${Date.now()}_${enrichedSignal.nonce}`,
-      });
+    this.emit('onConnectionStateChange', 'connecting', cleanId);
+
+    // If signaling server is not yet ready, queue the attempt
+    if (!this.peer || !this.isServerConnected || this.peer.destroyed) {
+      this.pendingConnectTarget = cleanId;
+      return;
     }
-  }
 
-  /**
-   * Process incoming WebRTC signaling data
-   */
-  async handleIncomingSignal(signal, key) {
-    if (!signal || !signal.from || signal.from === this.myPeerId) return;
-
-    // Deduplicate
-    const signalId = key || `${signal.from}_${signal.timestamp}_${signal.type}_${signal.nonce}`;
-    if (this.processedSignals.has(signalId)) return;
-    this.processedSignals.add(signalId);
-
-    // Filter out obsolete signals older than 3 minutes
-    if (signal.timestamp && Date.now() - signal.timestamp > 180000) return;
-
-    const { from, type, data } = signal;
-
-    switch (type) {
-      case 'offer':
-        await this.handleOffer(from, data);
-        break;
-      case 'answer':
-        await this.handleAnswer(data);
-        break;
-      case 'candidate':
-        await this.handleCandidate(data);
-        break;
-      case 'call-invite':
-        this.emit('onIncomingCall', {
-          callerId: from,
-          callerName: signal.callerName || from,
-          isVideo: !!signal.isVideo,
-          timestamp: signal.timestamp,
-        });
-        break;
-      case 'call-accept':
-        this.emit('onCallAccepted', { from, isVideo: !!signal.isVideo });
-        break;
-      case 'call-reject':
-        this.emit('onCallRejected', { from });
-        break;
-      case 'call-end':
-        this.emit('onCallEnded', { from });
-        this.cleanupCallMedia();
-        break;
-      default:
-        break;
-    }
-  }
-
-  /**
-   * Initialize a new RTCPeerConnection
-   */
-  createPeerConnection(remotePeerId) {
-    if (this.peerConnection) {
+    // Clean up previous connection if any
+    if (this.activeConnection) {
       try {
-        this.peerConnection.close();
+        this.activeConnection.close();
       } catch (e) {}
+      this.activeConnection = null;
     }
 
-    this.remotePeerId = remotePeerId;
-    this.peerConnection = new RTCPeerConnection({
-      iceServers: ICE_SERVERS,
+    try {
+      const conn = this.peer.connect(cleanId, {
+        reliable: true,
+      });
+
+      this.setupConnectionListeners(conn);
+    } catch (err) {
+      console.error('[P2P] Failed to initiate connection:', err);
+      this.scheduleAutoRetry();
+    }
+  }
+
+  /**
+   * Automatically retry connecting if the remote peer is not yet online
+   */
+  scheduleAutoRetry() {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    if (!this.remotePeerId) return;
+
+    // Retry every 4 seconds up to 15 times
+    if (this.retryCount < 15) {
+      this.retryCount += 1;
+      this.retryTimer = setTimeout(() => {
+        if (
+          this.remotePeerId &&
+          (!this.activeConnection || !this.activeConnection.open)
+        ) {
+          console.log(`[P2P] Auto-retrying connection to ${this.remotePeerId} (attempt ${this.retryCount})...`);
+          this.connectToPeer(this.remotePeerId);
+        }
+      }, 4000);
+    }
+  }
+
+  manualRetry() {
+    this.retryCount = 0;
+    if (this.remotePeerId) {
+      this.connectToPeer(this.remotePeerId);
+    }
+  }
+
+  /**
+   * Setup listeners for an active DataConnection
+   */
+  setupConnectionListeners(conn) {
+    conn.on('open', () => {
+      console.log('[P2P] Data connection opened with:', conn.peer);
+      this.activeConnection = conn;
+      this.remotePeerId = conn.peer.toLowerCase();
+      this.retryCount = 0;
+      if (this.retryTimer) clearTimeout(this.retryTimer);
+
+      this.emit('onConnectionStateChange', 'connected', this.remotePeerId);
+      this.startHeartbeat();
+
+      // Broadcast locally as well for same-device tabs
+      if (this.bc) {
+        this.bc.postMessage({
+          targetPeerId: this.remotePeerId,
+          type: 'ping',
+          payload: { from: this.myPeerId },
+        });
+      }
     });
 
-    this.peerConnection.onicecandidate = (event) => {
-      if (event.candidate && this.remotePeerId) {
-        this.sendSignal(this.remotePeerId, {
-          type: 'candidate',
-          data: JSON.stringify(event.candidate),
-        });
+    conn.on('data', (data) => {
+      this.handleIncomingData(data);
+    });
+
+    conn.on('close', () => {
+      console.log('[P2P] Data connection closed with:', conn.peer);
+      if (this.activeConnection === conn) {
+        this.activeConnection = null;
+        this.stopHeartbeat();
+        this.emit('onConnectionStateChange', 'disconnected', conn.peer);
       }
-    };
+    });
 
-    this.peerConnection.onconnectionstatechange = () => {
-      const state = this.peerConnection.connectionState;
-      this.emit('onConnectionStateChange', state, this.remotePeerId);
-    };
+    conn.on('error', (err) => {
+      console.warn('[P2P] Connection error with:', conn.peer, err);
+      this.scheduleAutoRetry();
+    });
 
-    this.peerConnection.oniceconnectionstatechange = () => {
-      const iceState = this.peerConnection.iceConnectionState;
-      this.emit('onIceStateChange', iceState);
-    };
-
-    this.peerConnection.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        this.remoteStream = event.streams[0];
-        this.emit('onRemoteStream', this.remoteStream);
-      }
-    };
-
-    return this.peerConnection;
+    // Monitor underlying RTCPeerConnection ICE state
+    if (conn.peerConnection) {
+      conn.peerConnection.oniceconnectionstatechange = () => {
+        const ice = conn.peerConnection.iceConnectionState;
+        this.emit('onIceStateChange', ice);
+      };
+    }
   }
 
   /**
-   * Setup DataChannel listeners
+   * Handle incoming connection from remote peer
    */
-  setupDataChannel(channel) {
-    this.dataChannel = channel;
-    this.dataChannel.binaryType = 'arraybuffer';
+  handleIncomingConnection(conn) {
+    const incomingPeerId = conn.peer.toLowerCase();
 
-    this.dataChannel.onopen = () => {
-      this.emit('onConnectionStateChange', 'connected', this.remotePeerId);
-    };
+    // If we already have an open connection with this peer, accept it or reuse
+    if (this.activeConnection && this.activeConnection.open && this.activeConnection.peer.toLowerCase() === incomingPeerId) {
+      conn.close();
+      return;
+    }
 
-    this.dataChannel.onclose = () => {
-      this.emit('onConnectionStateChange', 'disconnected', this.remotePeerId);
-    };
-
-    this.dataChannel.onerror = (err) => {
-      console.error('[DataChannel] Error:', err);
-    };
-
-    this.dataChannel.onmessage = (event) => {
-      this.handleDataChannelMessage(event.data);
-    };
+    this.remotePeerId = incomingPeerId;
+    this.setupConnectionListeners(conn);
   }
 
   /**
-   * Handle incoming DataChannel packet
+   * Heartbeat to keep NAT pinhole open indefinitely
    */
-  handleDataChannelMessage(data) {
+  startHeartbeat() {
+    this.stopHeartbeat();
+    this.pingInterval = setInterval(() => {
+      if (this.activeConnection && this.activeConnection.open) {
+        try {
+          this.activeConnection.send({ type: '__ping__', timestamp: Date.now() });
+        } catch (e) {}
+      }
+    }, 15000);
+  }
+
+  stopHeartbeat() {
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+    }
+  }
+
+  /**
+   * Process incoming messages and file chunks
+   */
+  handleIncomingData(data) {
+    if (!data) return;
+
+    let payload = data;
     if (typeof data === 'string') {
       try {
-        const parsed = JSON.parse(data);
-        if (parsed.type === 'file-meta') {
-          this.emit('onFileMeta', parsed);
-        } else if (parsed.type === 'chat') {
-          this.emit('onMessage', parsed);
-        } else if (parsed.type === 'file-chunk') {
-          this.emit('onFileChunk', parsed);
-        } else {
-          this.emit('onMessage', parsed);
-        }
-      } catch (err) {
-        this.emit('onMessage', { type: 'chat', text: data, from: this.remotePeerId });
+        payload = JSON.parse(data);
+      } catch (e) {
+        payload = { type: 'chat', text: data, sender: this.remotePeerId };
       }
-    } else if (data instanceof ArrayBuffer) {
-      // Direct raw binary chunk
-      this.emit('onFileChunk', { isBinary: true, buffer: data });
     }
-  }
 
-  /**
-   * Connect to a remote peer (Initiator)
-   */
-  async connectToPeer(targetPeerId) {
-    if (!targetPeerId) return;
-    this.remotePeerId = targetPeerId;
-    this.isInitiator = true;
-
-    const pc = this.createPeerConnection(targetPeerId);
-
-    // Create reliable ordered DataChannel for chat & file chunking
-    const dc = pc.createDataChannel('nexus_p2p_channel', {
-      ordered: true,
-    });
-    this.setupDataChannel(dc);
-
-    try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      this.sendSignal(targetPeerId, {
-        type: 'offer',
-        data: JSON.stringify(offer),
-      });
-
-      this.emit('onConnectionStateChange', 'connecting', targetPeerId);
-    } catch (err) {
-      console.error('[P2P] Failed to create offer:', err);
-      this.emit('onConnectionStateChange', 'failed', targetPeerId);
-    }
-  }
-
-  /**
-   * Handle incoming Offer (Receiver)
-   */
-  async handleOffer(fromPeerId, sdpStr) {
-    this.remotePeerId = fromPeerId;
-    this.isInitiator = false;
-
-    const pc = this.createPeerConnection(fromPeerId);
-
-    pc.ondatachannel = (event) => {
-      this.setupDataChannel(event.channel);
-    };
-
-    try {
-      const offer = JSON.parse(sdpStr);
-      await pc.setRemoteDescription(new RTCSessionDescription(offer));
-
-      // Flush queued candidates
-      while (this.pendingCandidates.length > 0) {
-        const cand = this.pendingCandidates.shift();
-        await pc.addIceCandidate(cand).catch(e => console.warn(e));
+    if (payload.type === '__ping__') {
+      if (this.activeConnection && this.activeConnection.open) {
+        try {
+          this.activeConnection.send({ type: '__pong__', timestamp: Date.now() });
+        } catch (e) {}
       }
+      return;
+    }
+    if (payload.type === '__pong__') {
+      return;
+    }
 
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
-      this.sendSignal(fromPeerId, {
-        type: 'answer',
-        data: JSON.stringify(answer),
-      });
-    } catch (err) {
-      console.error('[P2P] Error handling offer:', err);
+    if (payload.type === 'file-meta') {
+      this.emit('onFileMeta', payload);
+    } else if (payload.type === 'chat') {
+      this.emit('onMessage', payload);
+    } else if (payload.type === 'file-chunk') {
+      this.emit('onFileChunk', payload);
+    } else {
+      this.emit('onMessage', payload);
     }
   }
 
   /**
-   * Handle incoming Answer (Initiator)
-   */
-  async handleAnswer(sdpStr) {
-    if (!this.peerConnection) return;
-    try {
-      const answer = JSON.parse(sdpStr);
-      await this.peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-
-      while (this.pendingCandidates.length > 0) {
-        const cand = this.pendingCandidates.shift();
-        await this.peerConnection.addIceCandidate(cand).catch(e => console.warn(e));
-      }
-    } catch (err) {
-      console.error('[P2P] Error handling answer:', err);
-    }
-  }
-
-  /**
-   * Handle ICE Candidate
-   */
-  async handleCandidate(candidateStr) {
-    try {
-      const candidateObj = JSON.parse(candidateStr);
-      const candidate = new RTCIceCandidate(candidateObj);
-
-      if (this.peerConnection && this.peerConnection.remoteDescription) {
-        await this.peerConnection.addIceCandidate(candidate);
-      } else {
-        this.pendingCandidates.push(candidate);
-      }
-    } catch (err) {
-      console.error('[P2P] Error adding candidate:', err);
-    }
-  }
-
-  /**
-   * Send JSON chat or control message over DataChannel
+   * Send JSON chat message
    */
   sendChatMessage(messageText) {
-    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-      return false;
-    }
-
     const payload = {
       type: 'chat',
       id: `msg_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -413,54 +448,89 @@ export class P2PNetworkService {
       timestamp: Date.now(),
     };
 
-    this.dataChannel.send(JSON.stringify(payload));
-    return payload;
+    let sent = false;
+    if (this.activeConnection && this.activeConnection.open) {
+      this.activeConnection.send(payload);
+      sent = true;
+    }
+
+    // Also dispatch to local broadcast channel
+    if (this.bc && this.remotePeerId) {
+      this.bc.postMessage({
+        targetPeerId: this.remotePeerId,
+        type: 'data',
+        payload,
+      });
+      sent = true;
+    }
+
+    return sent ? payload : null;
   }
 
   /**
-   * Send arbitrary JSON payload over DataChannel
+   * Send arbitrary JSON payload (e.g. file metadata)
    */
   sendData(payload) {
-    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-      return false;
+    let sent = false;
+    if (this.activeConnection && this.activeConnection.open) {
+      this.activeConnection.send(payload);
+      sent = true;
     }
-    this.dataChannel.send(JSON.stringify(payload));
-    return true;
+
+    if (this.bc && this.remotePeerId) {
+      this.bc.postMessage({
+        targetPeerId: this.remotePeerId,
+        type: 'data',
+        payload,
+      });
+      sent = true;
+    }
+
+    return sent;
   }
 
   /**
-   * Send binary chunk with backpressure handling
+   * Send binary/chunk data with backpressure control
    */
   async sendChunkWithBackpressure(chunkPayload) {
-    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-      throw new Error('Data channel not open');
+    if (!this.activeConnection || !this.activeConnection.open) {
+      // If broadcast channel available for local test
+      if (this.bc && this.remotePeerId) {
+        this.bc.postMessage({
+          targetPeerId: this.remotePeerId,
+          type: 'data',
+          payload: chunkPayload,
+        });
+        return;
+      }
+      throw new Error('P2P connection not open');
     }
 
-    const BUFFER_LIMIT = 65536 * 4; // 256KB threshold
+    const dataChannel = this.activeConnection.dataChannel;
+    const BUFFER_LIMIT = 262144; // 256KB threshold
 
-    if (this.dataChannel.bufferedAmount > BUFFER_LIMIT) {
+    if (dataChannel && dataChannel.bufferedAmount > BUFFER_LIMIT) {
       await new Promise((resolve) => {
-        const onBufferedAmountLow = () => {
-          this.dataChannel.removeEventListener('bufferedamountlow', onBufferedAmountLow);
+        const onBufferedLow = () => {
+          dataChannel.removeEventListener('bufferedamountlow', onBufferedLow);
           resolve();
         };
-        this.dataChannel.bufferedAmountLowThreshold = 65536;
-        this.dataChannel.addEventListener('bufferedamountlow', onBufferedAmountLow);
+        dataChannel.bufferedAmountLowThreshold = 65536;
+        dataChannel.addEventListener('bufferedamountlow', onBufferedLow);
       });
     }
 
-    this.dataChannel.send(JSON.stringify(chunkPayload));
+    this.activeConnection.send(chunkPayload);
   }
 
   /**
-   * Call Signaling & Media Track Management
+   * Media Calling: Initiate Audio/Video Call
    */
   async initiateCall({ isVideo = false }) {
     if (!this.remotePeerId) {
-      throw new Error('No peer connected to call');
+      throw new Error('No remote peer specified for call');
     }
 
-    // Acquire user media
     const constraints = {
       audio: true,
       video: isVideo ? { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } } : false,
@@ -468,28 +538,21 @@ export class P2PNetworkService {
 
     this.localStream = await navigator.mediaDevices.getUserMedia(constraints);
 
-    // Ensure peerConnection is ready
-    if (!this.peerConnection) {
-      this.createPeerConnection(this.remotePeerId);
-    }
-
-    // Attach local audio/video tracks to peer connection
-    this.localStream.getTracks().forEach((track) => {
-      this.peerConnection.addTrack(track, this.localStream);
+    const call = this.peer.call(this.remotePeerId, this.localStream, {
+      metadata: { isVideo, callerId: this.myPeerId },
     });
 
-    // Notify peer of incoming call
-    this.sendSignal(this.remotePeerId, {
-      type: 'call-invite',
-      callerName: this.myPeerId,
-      isVideo,
-    });
+    this.activeMediaCall = call;
+    this.setupCallListeners(call);
 
     return this.localStream;
   }
 
+  /**
+   * Media Calling: Accept Incoming Call
+   */
   async acceptCall({ isVideo = false }) {
-    if (!this.remotePeerId) return null;
+    if (!this.incomingMediaCall) return null;
 
     const constraints = {
       audio: true,
@@ -498,51 +561,63 @@ export class P2PNetworkService {
 
     this.localStream = await navigator.mediaDevices.getUserMedia(constraints);
 
-    if (!this.peerConnection) {
-      this.createPeerConnection(this.remotePeerId);
-    }
+    this.incomingMediaCall.answer(this.localStream);
+    this.activeMediaCall = this.incomingMediaCall;
+    this.incomingMediaCall = null;
 
-    this.localStream.getTracks().forEach((track) => {
-      this.peerConnection.addTrack(track, this.localStream);
-    });
-
-    // Renegotiate offer/answer with media tracks
-    const offer = await this.peerConnection.createOffer();
-    await this.peerConnection.setLocalDescription(offer);
-
-    this.sendSignal(this.remotePeerId, {
-      type: 'offer',
-      data: JSON.stringify(offer),
-    });
-
-    this.sendSignal(this.remotePeerId, {
-      type: 'call-accept',
-      isVideo,
-    });
+    this.setupCallListeners(this.activeMediaCall);
+    this.emit('onCallAccepted', { from: this.remotePeerId, isVideo });
 
     return this.localStream;
+  }
+
+  setupCallListeners(call) {
+    call.on('stream', (stream) => {
+      this.remoteStream = stream;
+      this.emit('onRemoteStream', stream);
+      this.emit('onCallAccepted', { from: call.peer });
+    });
+
+    call.on('close', () => {
+      this.emit('onCallEnded', { from: call.peer });
+      this.cleanupCallMedia();
+    });
+
+    call.on('error', (err) => {
+      console.warn('[P2P] Media call error:', err);
+      this.emit('onCallEnded', { from: call.peer });
+      this.cleanupCallMedia();
+    });
   }
 
   rejectCall() {
-    if (this.remotePeerId) {
-      this.sendSignal(this.remotePeerId, {
-        type: 'call-reject',
-      });
+    if (this.incomingMediaCall) {
+      try {
+        this.incomingMediaCall.close();
+      } catch (e) {}
+      this.incomingMediaCall = null;
     }
   }
 
   endCall() {
-    if (this.remotePeerId) {
-      this.sendSignal(this.remotePeerId, {
-        type: 'call-end',
-      });
+    if (this.activeMediaCall) {
+      try {
+        this.activeMediaCall.close();
+      } catch (e) {}
+      this.activeMediaCall = null;
+    }
+    if (this.incomingMediaCall) {
+      try {
+        this.incomingMediaCall.close();
+      } catch (e) {}
+      this.incomingMediaCall = null;
     }
     this.cleanupCallMedia();
   }
 
   cleanupCallMedia() {
     if (this.localStream) {
-      this.localStream.getTracks().forEach((t) => t.stop());
+      this.localStream.getTracks().forEach((track) => track.stop());
       this.localStream = null;
     }
     this.remoteStream = null;

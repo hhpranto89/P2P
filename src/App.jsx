@@ -239,6 +239,7 @@ export default function App() {
             setCurrentScreen('contacts');
           }}
           onStartCall={handleStartCall}
+          onRetryConnect={() => handleConnect(remotePeerId)}
           onOpenSettings={() => setIsSettingsOpen(true)}
         />
       )}
